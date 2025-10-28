@@ -249,11 +249,13 @@ const SettingsPage = () => {
                       onChange={handleChange}
                       className="cyber-input w-full"
                     >
-                      <option value="ovh-eu">欧洲 (ovh-eu)</option>
-                      <option value="ovh-us">美国 (ovh-us)</option>
-                      <option value="ovh-ca">加拿大 (ovh-ca)</option>
+                      <option value="ovh-eu">🇪🇺 欧洲 (ovh-eu) - eu.api.ovh.com</option>
+                      <option value="ovh-us">🇺🇸 美国 (ovh-us) - api.us.ovhcloud.com</option>
+                      <option value="ovh-ca">🇨🇦 加拿大 (ovh-ca) - ca.api.ovh.com</option>
                     </select>
-                    <p className="text-xs text-cyber-muted mt-1">默认: ovh-eu</p>
+                    <p className="text-xs text-cyan-400 mt-1">
+                      ⚠️ 请选择与您OVH账户所在区域匹配的endpoint
+                    </p>
                   </div>
                 </div>
               </div>
@@ -412,7 +414,21 @@ const SettingsPage = () => {
                         <polyline points="15 3 21 3 21 9"></polyline>
                         <line x1="10" y1="14" x2="21" y2="3"></line>
                       </svg>
-                      EU区域 (欧洲)
+                      🇪🇺 欧洲 (ovh-eu) - eu.api.ovh.com
+                    </a>
+                    
+                    <a 
+                      href="https://api.us.ovhcloud.com/createToken/" 
+                      target="_blank" 
+                      rel="noopener noreferrer"
+                      className="cyber-button text-xs w-full inline-flex items-center justify-center bg-blue-500/10 border-blue-500/30 hover:bg-blue-500/20"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="mr-1.5">
+                        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                        <polyline points="15 3 21 3 21 9"></polyline>
+                        <line x1="10" y1="14" x2="21" y2="3"></line>
+                      </svg>
+                      🇺🇸 美国 (ovh-us) - api.us.ovhcloud.com
                     </a>
                     
                     <a 
@@ -426,27 +442,18 @@ const SettingsPage = () => {
                         <polyline points="15 3 21 3 21 9"></polyline>
                         <line x1="10" y1="14" x2="21" y2="3"></line>
                       </svg>
-                      CA区域 (加拿大)
-                    </a>
-                    
-                    <a 
-                      href="https://us.api.ovh.com/createToken/" 
-                      target="_blank" 
-                      rel="noopener noreferrer"
-                      className="cyber-button text-xs w-full inline-flex items-center justify-center"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="mr-1.5">
-                        <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
-                        <polyline points="15 3 21 3 21 9"></polyline>
-                        <line x1="10" y1="14" x2="21" y2="3"></line>
-                      </svg>
-                      US区域 (美国)
+                      🇨🇦 加拿大 (ovh-ca) - ca.api.ovh.com
                     </a>
                   </div>
                   
-                  <p className="text-xs text-cyan-400 mt-3">
-                    💡 提示：根据您的服务器所在区域选择对应的API
-                  </p>
+                  <div className="bg-blue-500/10 border border-blue-500/30 rounded-lg p-3 mt-3">
+                    <p className="text-xs text-blue-300 font-semibold mb-1">💡 重要提示</p>
+                    <ul className="text-xs text-blue-200 space-y-1">
+                      <li>• 美国区请选择 <code className="bg-blue-500/20 px-1 py-0.5 rounded">ovh-us</code> 并访问 api.us.ovhcloud.com</li>
+                      <li>• Endpoint值请填写 ovh-eu / ovh-us / ovh-ca（不是完整URL）</li>
+                      <li>• Zone值对应填写 IE / US / CA</li>
+                    </ul>
+                  </div>
                 </div>
                 
                 <div className="cyber-grid-line pt-4">

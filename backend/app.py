@@ -369,6 +369,21 @@ def update_stats():
         "purchaseFailed": failed_count
     }
 
+# Helper: 根据endpoint配置获取API基础URL
+def get_api_base_url():
+    """
+    根据用户的endpoint配置返回对应的API基础URL
+    
+    Returns:
+        str: API基础URL (如 https://api.us.ovhcloud.com)
+    """
+    endpoint_urls = {
+        'ovh-eu': 'https://eu.api.ovh.com',
+        'ovh-us': 'https://api.us.ovhcloud.com',
+        'ovh-ca': 'https://ca.api.ovh.com'
+    }
+    return endpoint_urls.get(config.get('endpoint', 'ovh-eu'), 'https://eu.api.ovh.com')
+
 # Initialize OVH client
 def get_ovh_client():
     if not config["appKey"] or not config["appSecret"] or not config["consumerKey"]:
@@ -3586,8 +3601,9 @@ def install_os(service_name):
         import time
         import hashlib
         
-        # 构建完整URL - 使用reinstall端点
-        api_url = f"https://eu.api.ovh.com/1.0/dedicated/server/{service_name}/reinstall"
+        # 根据endpoint配置动态构建API URL
+        base_url = get_api_base_url()
+        api_url = f"{base_url}/1.0/dedicated/server/{service_name}/reinstall"
         
         # 获取认证信息
         app_key = config.get('appKey', '')
@@ -4637,8 +4653,9 @@ def get_traffic_statistics(service_name):
             # 尝试使用requests库直接调用（因为OVH SDK对这个API支持有问题）
             import requests as req
             
-            # 构建完整的API URL
-            api_url = f"https://eu.api.ovh.com/1.0/dedicated/server/{service_name}/statistics?period={period}&type={type_param}"
+            # 根据endpoint配置动态构建API URL
+            base_url = get_api_base_url()
+            api_url = f"{base_url}/1.0/dedicated/server/{service_name}/statistics?period={period}&type={type_param}"
             
             # 获取OVH认证信息
             app_key = config.get('appKey', '')
@@ -4732,7 +4749,9 @@ def check_vps_datacenter_availability(plan_code, ovh_subsidiary="IE"):
         dict: 包含数据中心可用性信息的字典
     """
     try:
-        url = f"https://eu.api.ovh.com/v1/vps/order/rule/datacenter"
+        # 根据endpoint配置动态构建API URL
+        base_url = get_api_base_url()
+        url = f"{base_url}/v1/vps/order/rule/datacenter"
         params = {
             'ovhSubsidiary': ovh_subsidiary,
             'planCode': plan_code
