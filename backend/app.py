@@ -4889,6 +4889,99 @@ def get_server_tasks(service_name):
         add_log("ERROR", f"获取服务器 {service_name} 任务列表失败: {str(e)}", "server_control")
         return jsonify({"success": False, "error": str(e)}), 500
 
+# ==================== 任务可用时间段（计划干预） ====================
+@app.route('/api/server-control/<path:service_name>/tasks/<int:task_id>/available-timeslots', methods=['GET', 'OPTIONS'])
+def get_task_available_timeslots(service_name, task_id):
+    """查询指定任务在时间范围内的可用时间段"""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    client = get_ovh_client()
+    if not client:
+        return jsonify({"success": False, "error": "未配置OVH API密钥"}), 401
+
+    try:
+        period_start = request.args.get('periodStart')
+        period_end = request.args.get('periodEnd')
+
+        if not period_start or not period_end:
+            return jsonify({"success": False, "error": "缺少 periodStart 或 periodEnd 参数 (ISO8601)"}), 400
+
+        add_log("INFO", f"[Task] 查询任务 {task_id} 的可用时间段 {period_start} -> {period_end}", "server_control")
+
+        slots = client.get(
+            f'/dedicated/server/{service_name}/task/{task_id}/availableTimeslots',
+            periodStart=period_start,
+            periodEnd=period_end
+        )
+
+        return jsonify({
+            "success": True,
+            "timeslots": slots or []
+        })
+    except OvhAPIError as e:
+        message = str(e)
+        # 无需预约：返回200并标注
+        if 'no schedule needed' in message.lower():
+            add_log("INFO", f"[Task] 任务无需预约: {message}", "server_control")
+            return jsonify({
+                "success": True,
+                "timeslots": [],
+                "scheduleNotRequired": True,
+                "message": "该任务无需预约"
+            }), 200
+        # 任务或服务器不存在 → 404
+        if 'not found' in message.lower() or 'does not exist' in message.lower():
+            return jsonify({"success": False, "error": "任务或服务器不存在"}), 404
+        add_log("ERROR", f"[Task] 可用时间段API错误: {message}", "server_control")
+        return jsonify({"success": False, "error": message}), 502
+    except Exception as e:
+        add_log("ERROR", f"[Task] 查询可用时间段失败: {str(e)}", "server_control")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route('/api/server-control/<path:service_name>/tasks/<int:task_id>/schedule', methods=['POST', 'OPTIONS'])
+def schedule_task_timeslot(service_name, task_id):
+    """为任务预约执行时间段"""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    client = get_ovh_client()
+    if not client:
+        return jsonify({"success": False, "error": "未配置OVH API密钥"}), 401
+
+    try:
+        data = request.get_json() or {}
+        start_date = data.get('startDate')
+        end_date = data.get('endDate')
+
+        if not start_date or not end_date:
+            return jsonify({"success": False, "error": "缺少 startDate 或 endDate (ISO8601)"}), 400
+
+        add_log("INFO", f"[Task] 预约任务 {task_id} 时间段 {start_date} -> {end_date}", "server_control")
+
+        result = client.post(
+            f'/dedicated/server/{service_name}/task/{task_id}/schedule',
+            startDate=start_date,
+            endDate=end_date
+        )
+
+        return jsonify({
+            "success": True,
+            "result": result
+        })
+    except OvhAPIError as e:
+        message = str(e)
+        # 无需预约：直接提示不支持预约
+        if 'no schedule needed' in message.lower():
+            return jsonify({"success": False, "error": "该任务无需或不支持预约"}), 400
+        if 'not found' in message.lower() or 'does not exist' in message.lower():
+            return jsonify({"success": False, "error": "任务或服务器不存在"}), 404
+        add_log("ERROR", f"[Task] 预约任务API错误: {message}", "server_control")
+        return jsonify({"success": False, "error": message}), 502
+    except Exception as e:
+        add_log("ERROR", f"[Task] 预约任务失败: {str(e)}", "server_control")
+        return jsonify({"success": False, "error": str(e)}), 500
+
 # ==================== 服务器高级管理功能 ====================
 
 @app.route('/api/server-control/<service_name>/boot', methods=['OPTIONS', 'GET'])

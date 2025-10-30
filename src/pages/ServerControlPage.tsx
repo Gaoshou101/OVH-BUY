@@ -157,6 +157,13 @@ const ServerControlPage: React.FC = () => {
   // Task 4: 任务查看状态
   const [showTasksDialog, setShowTasksDialog] = useState(false);
   const [serverTasks, setServerTasks] = useState<ServerTask[]>([]);
+  // 任务可用时间段
+  const [showTimeslotsDialog, setShowTimeslotsDialog] = useState(false);
+  const [selectedTaskForTimeslots, setSelectedTaskForTimeslots] = useState<ServerTask | null>(null);
+  const [timeslots, setTimeslots] = useState<{ startDate: string; endDate: string; }[]>([]);
+  const [loadingTimeslots, setLoadingTimeslots] = useState(false);
+  const [periodStart, setPeriodStart] = useState<string>('');
+  const [periodEnd, setPeriodEnd] = useState<string>('');
   
   // Task 5: 监控功能
   const [monitoring, setMonitoring] = useState(false);
@@ -952,6 +959,47 @@ const ServerControlPage: React.FC = () => {
     setSelectedServer(server);
     setShowTasksDialog(true);
     await fetchServerTasks(server.serviceName);
+  };
+
+  const openTimeslots = async (task: ServerTask) => {
+    if (!selectedServer) return;
+    setSelectedTaskForTimeslots(task);
+    // 默认查询未来14天
+    const now = new Date();
+    const end = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
+    const startIso = now.toISOString();
+    const endIso = end.toISOString();
+    setPeriodStart(startIso);
+    setPeriodEnd(endIso);
+    setShowTimeslotsDialog(true);
+    await fetchAvailableTimeslots(task.taskId, startIso, endIso);
+  };
+
+  const fetchAvailableTimeslots = async (taskId: number, start: string, end: string) => {
+    if (!selectedServer) return;
+    setLoadingTimeslots(true);
+    try {
+      const response = await api.get(`/server-control/${selectedServer.serviceName}/tasks/${taskId}/available-timeslots`, {
+        params: { periodStart: start, periodEnd: end }
+      });
+      if (response.data.success) {
+        setTimeslots(response.data.timeslots || []);
+        if (response.data.scheduleNotRequired) {
+          showToast({ type: 'info', title: '该任务无需预约' });
+        } else if ((response.data.timeslots || []).length === 0) {
+          showToast({ type: 'info', title: '无可用时间段' });
+        }
+      } else {
+        setTimeslots([]);
+      }
+    } catch (error: any) {
+      console.error('获取可用时间段失败:', error);
+      const msg = error?.response?.data?.error || '获取可用时间段失败';
+      showToast({ type: 'error', title: msg });
+      setTimeslots([]);
+    } finally {
+      setLoadingTimeslots(false);
+    }
   };
 
   // Task 5: 获取监控状态
@@ -2684,6 +2732,103 @@ const ServerControlPage: React.FC = () => {
       document.body
       )}
 
+      {/* 任务可用时间段对话框 */}
+      {createPortal(
+        <AnimatePresence>
+          {showTimeslotsDialog && (
+            <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-2 sm:p-4">
+              <motion.div
+                initial={{ opacity: 0, scale: 0.9 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.9 }}
+                className="cyber-card max-w-3xl w-full max-h-[90vh] overflow-y-auto">
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-2">
+                    <Calendar className="w-5 h-5 text-cyber-accent" />
+                    <h3 className="text-xl font-semibold text-cyber-text">
+                      可用时间段 - 任务 {selectedTaskForTimeslots?.taskId}
+                    </h3>
+                  </div>
+                  <button
+                    onClick={() => setShowTimeslotsDialog(false)}
+                    className="text-cyber-muted hover:text-cyber-text transition-colors">
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
+                  <div>
+                    <label className="text-sm text-cyber-muted">开始时间 (ISO8601)</label>
+                    <input
+                      className="w-full mt-1 bg-transparent border border-cyber-accent/30 rounded px-3 py-2 text-sm"
+                      value={periodStart}
+                      onChange={(e) => setPeriodStart(e.target.value)}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-sm text-cyber-muted">结束时间 (ISO8601)</label>
+                    <input
+                      className="w-full mt-1 bg-transparent border border-cyber-accent/30 rounded px-3 py-2 text-sm"
+                      value={periodEnd}
+                      onChange={(e) => setPeriodEnd(e.target.value)}
+                    />
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3 mb-4">
+                  <button
+                    onClick={() => selectedTaskForTimeslots && fetchAvailableTimeslots(selectedTaskForTimeslots.taskId, periodStart, periodEnd)}
+                    disabled={loadingTimeslots}
+                    className="px-3 py-2 bg-cyber-accent text-white rounded hover:bg-cyber-accent/80 disabled:opacity-60"
+                  >
+                    {loadingTimeslots ? '查询中...' : '查询时间段'}
+                  </button>
+                </div>
+
+                {loadingTimeslots ? (
+                  <div className="flex items-center gap-2 text-cyber-muted">
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    加载中...
+                  </div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    {timeslots.length === 0 ? (
+                      <p className="text-sm text-cyber-muted">暂无可用时间段</p>
+                    ) : (
+                      <table className="w-full">
+                        <thead>
+                          <tr className="border-b border-cyber-accent/30">
+                            <th className="text-left py-3 px-4 text-cyber-text font-semibold">开始</th>
+                            <th className="text-left py-3 px-4 text-cyber-text font-semibold">结束</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {timeslots.map((s, idx) => (
+                            <tr key={idx} className="border-b border-cyber-accent/10">
+                              <td className="py-3 px-4 text-sm text-cyber-text">{new Date(s.startDate).toLocaleString('zh-CN')}</td>
+                              <td className="py-3 px-4 text-sm text-cyber-text">{new Date(s.endDate).toLocaleString('zh-CN')}</td>
+                            </tr>)
+                          )}
+                        </tbody>
+                      </table>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex justify-end mt-6">
+                  <button
+                    onClick={() => setShowTimeslotsDialog(false)}
+                    className="px-4 py-2 bg-cyber-accent text-white rounded-lg hover:bg-cyber-accent/80 transition-all">
+                    关闭
+                  </button>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>,
+        document.body
+      )}
+
       {/* 分区编辑器对话框 */}
       {createPortal(
         <AnimatePresence>
@@ -2892,7 +3037,17 @@ const ServerControlPage: React.FC = () => {
                           <td className="py-3 px-4 font-mono text-sm text-cyber-text">
                             {task.taskId}
                           </td>
-                          <td className="py-3 px-4 text-cyber-text">{task.function}</td>
+                          <td className="py-3 px-4 text-cyber-text">
+                            <div className="flex items-center gap-3">
+                              <span>{task.function}</span>
+                              <button
+                                onClick={() => openTimeslots(task)}
+                                className="px-2 py-1 text-xs border border-cyber-accent/40 rounded hover:bg-cyber-accent/10"
+                              >
+                                可用时间段
+                              </button>
+                            </div>
+                          </td>
                           <td className="py-3 px-4">
                             <span className={`text-sm capitalize ${
                               task.status === 'done' ? 'text-green-400' : 
