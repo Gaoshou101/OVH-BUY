@@ -146,6 +146,13 @@ const ServersPage = () => {
   
   // 显示模式已移除，固定显示完整内容
   
+  // 数据中心区域分组
+  const DATACENTER_REGIONS = {
+    '欧洲': ['gra', 'sbg', 'rbx', 'waw', 'fra', 'lon'],
+    '北美': ['bhs', 'hil', 'vin'],
+    '亚太': ['sgp', 'syd', 'mum'],
+  };
+  
   // 移动端强制使用网格视图
   useEffect(() => {
     if (isMobile && viewMode === 'list') {
@@ -721,50 +728,23 @@ const ServersPage = () => {
     }
   };
 
-  // 切换特定服务器的数据中心选择状态（优化版 - 使用原生DOM避免React重渲染闪烁）
+  // 切换特定服务器的数据中心选择状态
   const toggleDatacenterSelection = (serverPlanCode: string, datacenter: string, event?: React.MouseEvent<HTMLDivElement>) => {
-    // 立即通过原生DOM更新UI（避免React重渲染）
-    if (event?.currentTarget) {
-      const element = event.currentTarget;
-      const isCurrentlySelected = selectedDatacenters[serverPlanCode]?.[datacenter];
-      const newIsSelected = !isCurrentlySelected;
-      
-      // 立即更新DOM样式（无延迟，无重渲染）
-      if (newIsSelected) {
-        element.style.backgroundColor = 'rgba(100, 255, 218, 0.2)';
-        element.style.borderColor = 'rgb(100, 255, 218)';
-      } else {
-        element.style.backgroundColor = 'rgba(30, 41, 59, 0.6)';
-        element.style.borderColor = 'rgb(51, 65, 85)';
-      }
-      
-      // 更新文字颜色
-      const codeSpan = element.querySelector('.dc-code') as HTMLElement;
-      const nameSpan = element.querySelector('.dc-name') as HTMLElement;
-      if (codeSpan) {
-        codeSpan.style.color = newIsSelected ? 'rgb(100, 255, 218)' : 'rgb(241, 245, 249)';
-      }
-      if (nameSpan) {
-        nameSpan.style.color = newIsSelected ? 'rgb(203, 213, 225)' : 'rgb(148, 163, 184)';
-      }
-      
-      // 更新选中标记
-      const checkmark = element.querySelector('.dc-checkmark') as HTMLElement;
-      if (checkmark) {
-        checkmark.style.display = newIsSelected ? 'flex' : 'none';
-        checkmark.style.opacity = newIsSelected ? '1' : '0';
-      }
+    if (event) {
+      event.stopPropagation();
     }
     
-    // 延迟更新React状态（避免立即重渲染）
-    requestAnimationFrame(() => {
-      setSelectedDatacenters(prev => ({
+    setSelectedDatacenters(prev => {
+      if (!prev[serverPlanCode]) {
+        prev[serverPlanCode] = {};
+      }
+      return {
         ...prev,
         [serverPlanCode]: {
           ...prev[serverPlanCode],
           [datacenter]: !prev[serverPlanCode]?.[datacenter]
         }
-      }));
+      };
     });
   };
 
@@ -772,11 +752,40 @@ const ServersPage = () => {
   const toggleAllDatacenters = (serverPlanCode: string, selected: boolean) => {
     setSelectedDatacenters(prev => {
       const newServerState = { ...prev };
-      if (newServerState[serverPlanCode]) {
-        Object.keys(newServerState[serverPlanCode]).forEach(dc => {
-          newServerState[serverPlanCode][dc] = selected;
-        });
+      
+      // 获取当前服务器应该显示的所有数据中心（考虑区域过滤）
+      const planCodeLower = serverPlanCode.toLowerCase();
+      const allAvailableDCs: string[] = [];
+      
+      // 遍历所有区域的数据中心
+      Object.entries(DATACENTER_REGIONS).forEach(([_, dcCodes]) => {
+        OVH_DATACENTERS
+          .filter(dc => dcCodes.includes(dc.code))
+          .filter(dc => {
+            // 应用与渲染时相同的过滤规则
+            if (planCodeLower.includes('-sgp')) return dc.code === 'sgp';
+            if (planCodeLower.includes('-syd')) return dc.code === 'syd';
+            if (planCodeLower.includes('-mum')) return dc.code === 'mum';
+            return true;
+          })
+          .forEach(dc => {
+            const dcCode = dc.code.toUpperCase();
+            if (!allAvailableDCs.includes(dcCode)) {
+              allAvailableDCs.push(dcCode);
+            }
+          });
+      });
+      
+      // 初始化服务器状态（如果不存在）
+      if (!newServerState[serverPlanCode]) {
+        newServerState[serverPlanCode] = {};
       }
+      
+      // 设置所有可用数据中心的选中状态
+      allAvailableDCs.forEach(dcCode => {
+        newServerState[serverPlanCode][dcCode] = selected;
+      });
+      
       return newServerState;
     });
   };
@@ -1699,12 +1708,6 @@ const ServersPage = () => {
     );
   };
 
-  const DATACENTER_REGIONS = {
-    '欧洲': ['gra', 'sbg', 'rbx', 'waw', 'fra', 'lon'],
-    '北美': ['bhs', 'hil', 'vin'],
-    '亚太': ['sgp', 'syd', 'mum'],
-  };
-
   return (
     <div className="space-y-6 w-full" style={{ maxWidth: '100%', overflowX: 'hidden' }}>
       <div className="mb-2">
@@ -2097,95 +2100,55 @@ const ServersPage = () => {
                         if (regionDatacenters.length === 0) return null;
 
                         return (
-                          <div key={region} className="mb-3 last:mb-0">
-                            <h3 className="text-xs font-bold text-cyber-accent/80 mb-2 tracking-wider pl-1">{region}</h3>
-                            <div className="flex flex-col gap-1.5">
+                          <div key={region} className="mb-4 last:mb-0">
+                            <h3 className="text-xs font-bold text-cyber-accent/80 mb-2.5">{region}</h3>
+                            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-3 lg:grid-cols-4 gap-2">
                               {regionDatacenters.map(dc => {
                                   const dcCode = dc.code.toUpperCase();
                                   const availStatus = availability[server.planCode]?.[dcCode.toLowerCase()] || "unknown";
                                   const isSelected = selectedDatacenters[server.planCode]?.[dcCode];
                                   
-                                  let statusText = "查询中";
-                                  let statusColor = "text-yellow-400";
+                                  let statusText = "";
                                   let statusBgColor = "bg-yellow-400";
+                                  let showStatusText = false;
                                   
                                   if (availStatus === "unavailable") {
                                     statusText = "不可用";
-                                    statusColor = "text-red-400";
                                     statusBgColor = "bg-red-400";
+                                    showStatusText = true;
                                   } else if (availStatus && availStatus !== "unknown") {
                                     statusText = availStatus.includes("H") ? availStatus : "可用";
-                                    statusColor = "text-green-400";
                                     statusBgColor = "bg-green-400";
+                                    showStatusText = true;
                                   }
                                   
                                   return (
                                     <div 
                                       key={dcCode}
-                                      className={`dc-bar group relative rounded-md cursor-pointer transition-all duration-300 border p-2.5 flex items-center justify-between overflow-hidden ${
+                                      className={`rounded border cursor-pointer transition-colors duration-150 px-2.5 py-2 flex flex-col gap-1.5 min-w-0 ${
                                         isSelected 
-                                          ? 'border-cyber-accent bg-gradient-to-r from-cyber-accent/15 to-cyber-accent/5 shadow-lg shadow-cyber-accent/20 scale-[1.02]' 
-                                          : 'border-slate-700/50 bg-gradient-to-r from-slate-800/50 to-slate-800/30 hover:border-cyber-accent/50 hover:bg-gradient-to-r hover:from-slate-700/60 hover:to-slate-800/50 hover:shadow-md hover:scale-[1.01]'
+                                          ? 'border-cyber-accent/60 bg-cyber-accent/10 text-cyber-accent' 
+                                          : 'border-slate-700/40 bg-slate-800/30 text-slate-300 hover:border-cyber-accent/40 hover:bg-slate-800/50'
                                       }`}
                                       onClick={(e) => toggleDatacenterSelection(server.planCode, dcCode, e)}
-                                      title={`${dc.name} (${dc.region}) - ${statusText}`}
+                                      title={`${dc.name} (${dc.region})${statusText ? ` - ${statusText}` : ''}`}
                                     >
-                                      {/* 选中时的光晕效果 */}
-                                      {isSelected && (
-                                        <div className="absolute inset-0 bg-cyber-accent/10 animate-pulse rounded-md"></div>
-                                      )}
-                                      
-                                      {/* 悬停时的背景动画 */}
-                                      <div className="absolute inset-0 bg-gradient-to-r from-cyber-accent/0 via-cyber-accent/5 to-cyber-accent/0 opacity-0 group-hover:opacity-100 transition-opacity duration-300 rounded-md"></div>
-                                      
-                                      <div className="flex items-center gap-2 relative z-10">
-                                        <div>
-                                          <span className={`font-bold tracking-wide transition-colors duration-300 ${
-                                            isSelected 
-                                              ? 'text-cyber-accent drop-shadow-[0_0_4px_rgba(100,255,218,0.5)]' 
-                                              : 'text-slate-200 group-hover:text-cyber-accent/80'
-                                          }`}>
-                                            {dcCode}
-                                          </span>
-                                          <span className={`text-xs ml-1.5 hidden sm:inline transition-colors duration-300 ${
-                                            isSelected ? 'text-slate-300' : 'text-slate-400 group-hover:text-slate-300'
-                                          }`}>
-                                            {dc.name}
-                                          </span>
-                                        </div>
+                                      <div className="flex items-center justify-between gap-1">
+                                        <span className="text-xs font-medium tracking-wide whitespace-nowrap">{dcCode}</span>
+                                        <span className={`w-1.5 h-1.5 rounded-full ${statusBgColor} flex-shrink-0`}></span>
                                       </div>
-                                      
-                                      <div className={`flex items-center gap-1.5 text-xs font-medium relative z-10 ${statusColor}`}>
-                                        <span 
-                                          className={`w-2.5 h-2.5 rounded-full ${ statusBgColor } ${
-                                            availStatus === "unavailable" || availStatus === "unknown" 
-                                              ? '' 
-                                              : 'animate-pulse shadow-lg'
-                                          } ${
-                                            availStatus === "unavailable" 
-                                              ? 'shadow-red-400/50' 
-                                              : availStatus !== "unknown"
-                                              ? 'shadow-green-400/50'
-                                              : 'shadow-yellow-400/50'
-                                          }`}
-                                        ></span>
-                                        <span className="font-semibold">
-                                          {statusText}
-                                        </span>
+                                      <div className="min-w-0">
+                                        <span className="text-[10px] text-slate-400 break-words leading-tight">{dc.name}</span>
                                       </div>
-                                      
-                                      {/* 选中时的勾选标记 */}
-                                      {isSelected && (
-                                        <div className="absolute -top-1 -right-1 w-5 h-5 rounded-full bg-cyber-accent flex items-center justify-center shadow-lg shadow-cyber-accent/50 transition-all duration-200 scale-100">
-                                          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="rgb(15, 23, 42)" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
-                                            <polyline points="20 6 9 17 4 12"></polyline>
-                                          </svg>
+                                      {showStatusText && (
+                                        <div className="text-center">
+                                          <span className="text-[10px] font-medium whitespace-nowrap">{statusText}</span>
                                         </div>
                                       )}
                                     </div>
                                   );
                                 })}
-                              </div>
+                            </div>
                           </div>
                         );
                       })}
