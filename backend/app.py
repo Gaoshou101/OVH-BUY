@@ -1041,7 +1041,14 @@ def process_queue():
             time.sleep(1)
             continue
             
-        items_to_process = list(queue) # Create a copy to iterate over
+        # 复制一份并按优先级排序：quickOrder 优先，其次按创建时间
+        items_to_process = sorted(
+            list(queue),
+            key=lambda it: (
+                0 if it.get("quickOrder") else 1,                 # quickOrder 优先
+                -int(datetime.fromisoformat(it.get("createdAt")).timestamp()) if it.get("createdAt") else 0  # 越新越先
+            )
+        )
         for item in items_to_process:
             # 优先检查：任务是否在删除集合中（前端删除时立即生效）
             if item["id"] in deleted_task_ids:
@@ -4374,6 +4381,51 @@ def quick_order():
             add_log("WARNING", f"快速下单前价格缺失或无效: {plancode}@{datacenter}", "config_sniper")
             return jsonify({"success": False, "error": "该组合暂无有效价格，暂不支持下单"}), 400
 
+        # 防重复（仅限 quick-order）：若同一 planCode+datacenter+options（配置指纹）
+        # 已在队列运行/等待，或刚刚成功下过单，则拒绝再次入队
+        now_ts = time.time()
+        duplicate_window_seconds = 120  # 2分钟窗口
+
+        def _fingerprint(opts):
+            if not opts:
+                return ""
+            try:
+                # 规范化：字符串化、去重、排序，生成稳定指纹
+                norm = sorted({str(x).strip() for x in opts if x is not None and str(x).strip() != ""})
+                return "|".join(norm)
+            except Exception:
+                return "|".join(sorted(map(str, opts)))
+
+        target_fp = _fingerprint(options)
+
+        # 1) 检查队列中的运行中/等待中任务
+        for item in queue:
+            if (
+                item.get("planCode") == plancode and
+                item.get("datacenter") == datacenter and
+                item.get("status") in ["running", "pending", "paused"] and
+                _fingerprint(item.get("options")) == target_fp
+            ):
+                add_log("INFO", f"检测到重复的队列任务（含配置），拒绝再次入队: {plancode}@{datacenter} options={options} (任务ID: {item.get('id')})", "config_sniper")
+                return jsonify({"success": False, "error": "已存在相同配置的购买任务，稍后再试"}), 429
+        # 2) 检查近期成功的历史（避免短时间内多次下单）
+        for hist in reversed(purchase_history):
+            if (
+                hist.get("planCode") == plancode and
+                hist.get("datacenter") == datacenter and
+                hist.get("status") == "success" and
+                _fingerprint(hist.get("options")) == target_fp
+            ):
+                try:
+                    ts = hist.get("purchaseTime")
+                    # ISO 字符串 -> epoch
+                    recent = datetime.fromisoformat(ts).timestamp() if isinstance(ts, str) else None
+                    if recent and (now_ts - recent) < duplicate_window_seconds:
+                        add_log("INFO", f"检测到近期成功订单（含配置，{int(now_ts - recent)}秒内），拒绝再次入队: {plancode}@{datacenter} options={options}", "config_sniper")
+                        return jsonify({"success": False, "error": "刚刚已成功下过同配置订单，稍后再试"}), 429
+                except Exception:
+                    pass
+
         # 价格校验通过后再创建队列项（不再重复检查可用性）
         current_time = datetime.now().isoformat()
         queue_item = {
@@ -4384,14 +4436,17 @@ def quick_order():
             "status": "running",
             "retryCount": 0,
             "maxRetries": 3,
-            "retryInterval": 30,
+            # 快速下单使用更短的重试间隔，加快抢购节奏
+            "retryInterval": 2,
             "createdAt": current_time,
             "updatedAt": current_time,
             "lastCheckTime": 0,
-            "quickOrder": True  # 标记为快速下单
+            "quickOrder": True,  # 标记为快速下单
+            "priority": 100
         }
         
-        queue.append(queue_item)
+        # 将快速下单任务插入队列头部，提高优先级
+        queue.insert(0, queue_item)
         save_data()
         update_stats()
         
