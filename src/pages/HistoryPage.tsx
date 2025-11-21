@@ -15,7 +15,7 @@ interface PurchaseHistory {
   orderUrl?: string;
   errorMessage?: string;
   purchaseTime: string;
-  expirationTime?: string; // 订单过期时间（可选，如果没有则从 purchaseTime + 24小时计算）
+  expirationTime?: string; // 订单过期时间（可选，如果没有则从 purchaseTime + 15天计算）
   price?: {
     withTax?: number;
     withoutTax?: number;
@@ -24,15 +24,15 @@ interface PurchaseHistory {
   };
 }
 
-// 订单有效期（分钟）- OVH 订单通常为 15 分钟
-const ORDER_VALIDITY_MINUTES = 15;
+// 订单有效期（分钟）- 15 天 = 15 * 24 * 60 = 21600 分钟
+const ORDER_VALIDITY_MINUTES = 15 * 24 * 60; // 15天
 
 // 计算订单过期时间
 const getExpirationTime = (purchaseTime: string, expirationTime?: string): Date => {
   if (expirationTime) {
     return new Date(expirationTime);
   }
-  // 如果没有提供过期时间，从购买时间 + 15分钟计算
+  // 如果没有提供过期时间，从购买时间 + 15天计算
   const purchaseDate = new Date(purchaseTime);
   return new Date(purchaseDate.getTime() + ORDER_VALIDITY_MINUTES * 60 * 1000);
 };
@@ -43,11 +43,14 @@ const formatCountdown = (remainingMs: number): string => {
     return "已过期";
   }
   
-  const hours = Math.floor(remainingMs / (1000 * 60 * 60));
+  const days = Math.floor(remainingMs / (1000 * 60 * 60 * 24));
+  const hours = Math.floor((remainingMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
   const minutes = Math.floor((remainingMs % (1000 * 60 * 60)) / (1000 * 60));
   const seconds = Math.floor((remainingMs % (1000 * 60)) / 1000);
   
-  if (hours > 0) {
+  if (days > 0) {
+    return `${days}天${hours}时${minutes}分${seconds}秒`;
+  } else if (hours > 0) {
     return `${hours}时${minutes}分${seconds}秒`;
   } else if (minutes > 0) {
     return `${minutes}分${seconds}秒`;

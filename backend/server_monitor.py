@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 class ServerMonitor:
@@ -24,13 +25,14 @@ class ServerMonitor:
         """
         self.check_availability = check_availability_func
         self.send_notification = send_notification_func
-        self.add_log = add_log_func
+        self._external_add_log = add_log_func
         
         self.subscriptions = []  # 订阅列表
         self.known_servers = set()  # 已知服务器集合
         self.running = False  # 运行状态
         self.check_interval = 5  # 检查间隔（秒），默认5秒
         self.thread = None
+        self.max_workers = 4  # 并发检查的最大线程数
         
         # Options 缓存：key = f"{plan_code}|{datacenter}"，value = {"options": list, "timestamp": float}
         # 用于在 Telegram callback_data 中 options 丢失时恢复（旧机制，保留兼容性）
@@ -44,8 +46,27 @@ class ServerMonitor:
         
         # ✅ 添加线程锁保护缓存操作的并发安全
         self._cache_lock = threading.Lock()
+        self._trace_ctx = threading.local()
+
+        def _log_wrapper(level, message, category="monitor"):
+            trace_id = getattr(self._trace_ctx, "trace_id", None)
+            prefix = f"[trace:{trace_id}] " if trace_id else ""
+            self._external_add_log(level, f"{prefix}{message}", category)
+
+        self.add_log = _log_wrapper
         
         self.add_log("INFO", "服务器监控器初始化完成", "monitor")
+    
+    def _set_trace_id(self, trace_id):
+        if trace_id:
+            self._trace_ctx.trace_id = trace_id
+    
+    def _clear_trace_id(self):
+        if hasattr(self._trace_ctx, "trace_id"):
+            del self._trace_ctx.trace_id
+    
+    def _get_trace_id(self):
+        return getattr(self._trace_ctx, "trace_id", None)
     
     def _limit_history_size(self, subscription, max_size=100):
         """
@@ -147,7 +168,7 @@ class ServerMonitor:
         self.add_log("INFO", f"清空所有订阅 ({count} 项)", "monitor")
         return count
     
-    def check_availability_change(self, subscription):
+    def check_availability_change(self, subscription, trace_id=None):
         """
         检查单个订阅的可用性变化（配置级别监控）
         
@@ -155,6 +176,7 @@ class ServerMonitor:
             subscription: 订阅配置
         """
         plan_code = subscription["planCode"]
+        trace_id = trace_id or self._get_trace_id()
         
         try:
             # 获取当前可用性（支持配置级别）
@@ -185,7 +207,7 @@ class ServerMonitor:
                         continue
                     
                     old_status = last_status.get(dc)
-                    self._check_and_notify_change(subscription, plan_code, dc, status, old_status, None, dc)
+                    self._check_and_notify_change(subscription, plan_code, dc, status, old_status, None, dc, trace_id=trace_id)
                 
                 # 如果是配置级别的数据（新版配置监控）
                 elif isinstance(config_data, dict) and "datacenters" in config_data:
@@ -193,7 +215,9 @@ class ServerMonitor:
                     storage = config_data.get("storage", "N/A")
                     config_display = f"{memory} + {storage}"
                     
-                    self.add_log("INFO", f"检查配置: {config_display}", "monitor")
+                    # ✅ 为每个配置生成子 UUID，确保配置和价格匹配
+                    config_trace_id = str(uuid.uuid4())
+                    self.add_log("INFO", f"检查配置: {config_display} [config-trace:{config_trace_id}]", "monitor")
                     
                     # 准备配置信息
                     config_info = {
@@ -203,9 +227,11 @@ class ServerMonitor:
                         "options": config_data.get("options", [])  # 包含API2格式的选项代码
                     }
                     
-                    # 先收集所有需要发送通知的数据中心
-                    # ✅ 关键修改：只有价格校验通过才算真正有货
-                    notifications_to_send = []
+                    # ✅ 并发价格校验：先收集所有需要价格校验的数据中心，然后并发执行
+                    # 使用配置级别的子 UUID 进行追踪
+                    dc_status_map = {}  # dc -> (status, status_key, old_status)
+                    price_check_tasks = []  # 需要价格校验的任务列表
+                    
                     for dc, status in config_data["datacenters"].items():
                         # 如果指定了数据中心列表，只监控列表中的
                         if monitored_dcs and dc not in monitored_dcs:
@@ -214,27 +240,70 @@ class ServerMonitor:
                         # 使用配置作为key来追踪状态
                         status_key = f"{dc}|{config_key}"
                         old_status = last_status.get(status_key)
+                        dc_status_map[dc] = (status, status_key, old_status)
                         
-                        # ✅ 关键修改：如果可用性显示有货（status != "unavailable"），需要先进行价格校验
-                        # 只有价格校验通过才算真正有货
-                        actual_status = status
-                        price_check_failed = False  # 标记价格校验是否失败
-                        price_check_error = None  # 价格校验失败原因
+                        # 如果可用性显示有货，需要价格校验
                         if status != "unavailable":
-                            # 可用性显示有货，但需要价格校验确认
-                            price_available, price_check_error = self._verify_price_available(plan_code, dc, config_info)
-                            if not price_available:
-                                # 价格校验失败，使用特殊状态值标记，避免与真正的无货混淆
-                                actual_status = "price_check_failed"  # 使用特殊状态值
-                                price_check_failed = True  # 标记价格校验失败
-                                config_desc = f" [{config_display}]" if config_display else ""
-                                error_msg = f"，原因: {price_check_error}" if price_check_error else ""
-                                self.add_log("INFO", f"{plan_code}@{dc}{config_desc} 可用性显示有货但价格校验失败{error_msg}，标记为price_check_failed（将触发通知但不自动下单）", "monitor")
+                            price_check_tasks.append(dc)
+                    
+                    # ✅ 并发执行价格校验（使用配置级别的子 UUID）
+                    price_check_results = {}  # dc -> (price_available, price_check_error)
+                    if price_check_tasks:
+                        # 使用配置级别的子 UUID 进行价格校验追踪
+                        self._set_trace_id(config_trace_id)
+                        
+                        try:
+                            with ThreadPoolExecutor(max_workers=min(10, len(price_check_tasks))) as executor:
+                                future_to_dc = {
+                                    executor.submit(self._verify_price_available, plan_code, dc, config_info): dc
+                                    for dc in price_check_tasks
+                                }
+                                
+                                for future in as_completed(future_to_dc):
+                                    dc = future_to_dc[future]
+                                    try:
+                                        price_available, price_check_error = future.result()
+                                        price_check_results[dc] = (price_available, price_check_error)
+                                        config_desc = f" [{config_display}]" if config_display else ""
+                                        if price_available:
+                                            self.add_log("INFO", f"{plan_code}@{dc}{config_desc} 价格校验通过 [config-trace:{config_trace_id}]", "monitor")
+                                        else:
+                                            error_msg = f"，原因: {price_check_error}" if price_check_error else ""
+                                            self.add_log("INFO", f"{plan_code}@{dc}{config_desc} 价格校验失败{error_msg} [config-trace:{config_trace_id}]", "monitor")
+                                    except Exception as e:
+                                        # 价格校验异常，视为失败
+                                        price_check_results[dc] = (False, f"价格校验异常: {str(e)}")
+                                        self.add_log("WARNING", f"{plan_code}@{dc} 价格校验异常: {str(e)} [config-trace:{config_trace_id}]", "monitor")
+                        finally:
+                            self._clear_trace_id()
+                    
+                    # ✅ 根据价格校验结果确定实际状态
+                    notifications_to_send = []
+                    for dc, (status, status_key, old_status) in dc_status_map.items():
+                        # 确定实际状态
+                        actual_status = status
+                        price_check_failed = False
+                        price_check_error = None
+                        
+                        if status != "unavailable":
+                            # 可用性显示有货，需要根据价格校验结果确定实际状态
+                            if dc in price_check_results:
+                                price_available, price_check_error = price_check_results[dc]
+                                if not price_available:
+                                    actual_status = "price_check_failed"
+                                    price_check_failed = True
+                                    config_desc = f" [{config_display}]" if config_display else ""
+                                    error_msg = f"，原因: {price_check_error}" if price_check_error else ""
+                                    self.add_log("INFO", f"{plan_code}@{dc}{config_desc} 可用性显示有货但价格校验失败{error_msg}，标记为price_check_failed（将触发通知但不自动下单）", "monitor")
+                                else:
+                                    actual_status = "available"
+                                    config_desc = f" [{config_display}]" if config_display else ""
+                                    self.add_log("INFO", f"{plan_code}@{dc}{config_desc} 可用性有货且价格校验通过，确认有货", "monitor")
                             else:
-                                # 价格校验通过，真正有货
-                                actual_status = "available"
-                                config_desc = f" [{config_display}]" if config_display else ""
-                                self.add_log("INFO", f"{plan_code}@{dc}{config_desc} 可用性有货且价格校验通过，确认有货", "monitor")
+                                # 理论上不应该到这里，但为了安全起见
+                                actual_status = "price_check_failed"
+                                price_check_failed = True
+                                price_check_error = "价格校验未执行"
                         
                         # 检查是否需要发送通知（包括首次检查）
                         status_changed = False
@@ -306,6 +375,8 @@ class ServerMonitor:
                                     change_type = "price_check_failed"
                         
                         if status_changed:
+                            # ✅ 记录检测到有货的时间（用于计算延迟）
+                            detected_time = self._now_beijing()
                             notification_item = {
                                 "dc": dc,
                                 "status": actual_status,  # 使用实际状态（经过价格校验）
@@ -313,7 +384,10 @@ class ServerMonitor:
                                 "status_key": status_key,
                                 "change_type": change_type,
                                 "price_check_failed": price_check_failed,  # 标记价格校验失败
-                                "price_check_error": price_check_error  # 价格校验失败原因
+                                "price_check_error": price_check_error,  # 价格校验失败原因
+                                "config_trace_id": config_trace_id,  # 配置级别的子 UUID
+                                "trace_id": trace_id,  # 订阅级别的主 UUID
+                                "detected_time": detected_time.isoformat()  # 检测到有货的时间
                             }
                             # ✅ 如果是"从无货变有货"，添加补货历时时间
                             if change_type == "available" and old_status == "unavailable":
@@ -380,6 +454,7 @@ class ServerMonitor:
                     
                     # 对于同一个配置，只查询一次价格（使用第一个有货的数据中心）
                     price_text = None
+                    price_fetch_error = None
                     if notifications_to_send:
                         # 找出第一个有货的数据中心用于价格查询
                         first_available_dc = None
@@ -396,12 +471,18 @@ class ServerMonitor:
                                 price_queue = queue.Queue()
                                 
                                 def fetch_price():
+                                    local_trace_id = trace_id or self._get_trace_id()
+                                    if local_trace_id:
+                                        self._set_trace_id(local_trace_id)
                                     try:
                                         price_result = self._get_price_info(plan_code, first_available_dc, config_info)
                                         price_queue.put(price_result)
                                     except Exception as e:
                                         self.add_log("WARNING", f"价格获取线程异常: {str(e)}", "monitor")
                                         price_queue.put(None)
+                                    finally:
+                                        if local_trace_id:
+                                            self._clear_trace_id()
                                 
                                 # 启动价格获取线程
                                 price_thread = threading.Thread(
@@ -416,6 +497,7 @@ class ServerMonitor:
                                 
                                 if price_thread.is_alive():
                                     # ✅ 线程超时，记录详细信息（daemon线程会在主程序退出时自动结束）
+                                    price_fetch_error = f"价格接口超时（等待{elapsed_time:.1f}秒）"
                                     self.add_log("WARNING", 
                                         f"价格获取超时（已等待{elapsed_time:.1f}秒，线程ID: {price_thread.ident}），"
                                         f"发送不带价格的通知。daemon线程将在后台继续运行直到完成。", 
@@ -426,6 +508,7 @@ class ServerMonitor:
                                     try:
                                         price_text = price_queue.get_nowait()
                                     except queue.Empty:
+                                        price_fetch_error = f"价格接口结束但无返回数据（耗时{elapsed_time:.1f}秒）"
                                         price_text = None
                                         self.add_log("WARNING", 
                                             f"价格获取线程已完成但队列为空（耗时{elapsed_time:.1f}秒）", 
@@ -439,8 +522,11 @@ class ServerMonitor:
                                     self.add_log("WARNING", 
                                         f"配置 {config_display} 价格获取失败（耗时{elapsed_time:.1f}秒），通知中不包含价格信息", 
                                         "monitor")
+                                    if not price_fetch_error:
+                                        price_fetch_error = "价格接口未返回结果"
                             except Exception as e:
                                 # ✅ 统一错误处理：记录详细异常信息
+                                price_fetch_error = f"价格接口异常: {str(e)}"
                                 self.add_log("WARNING", f"价格获取过程异常: {str(e)}", "monitor")
                                 self.add_log("DEBUG", f"价格获取异常详情: {traceback.format_exc()}", "monitor")
                     
@@ -522,15 +608,22 @@ class ServerMonitor:
                         if config_info_with_price:
                             config_info_with_price["cached_price"] = price_text  # 传递查询到的价格
                         
-                        # 汇总所有有货的机房数据（包含补货历时时间）
+                        # 汇总所有有货的机房数据（包含补货历时时间和检测时间）
                         available_dcs = []
                         for n in available_notifications:
                             dc_info = {"dc": n["dc"], "status": n["status"]}
                             if "duration_text" in n:
                                 dc_info["duration_text"] = n["duration_text"]
+                            if "detected_time" in n:
+                                dc_info["detected_time"] = n["detected_time"]
                             available_dcs.append(dc_info)
+                        # 从第一个通知项中获取 config_trace_id（所有通知项共享同一个配置）
+                        config_trace_id_for_notif = available_notifications[0].get("config_trace_id") if available_notifications else None
                         self.send_availability_alert_grouped(
-                            plan_code, available_dcs, config_info_with_price, server_name
+                            plan_code, available_dcs, config_info_with_price, server_name,
+                            price_error_message=price_fetch_error if not price_text else None,
+                            trace_id=trace_id,
+                            config_trace_id=config_trace_id_for_notif
                         )
                         
                         # 添加到历史记录
@@ -579,7 +672,10 @@ class ServerMonitor:
                             config_info_with_price_failed if config_info_with_price_failed else config_info, 
                             server_name,
                             duration_text=None,
-                            price_check_error=notif.get("price_check_error")
+                            price_check_error=notif.get("price_check_error"),
+                            trace_id=trace_id,
+                            config_trace_id=notif.get("config_trace_id"),
+                            detected_time=notif.get("detected_time")
                         )
                         
                         # 添加到历史记录
@@ -599,105 +695,118 @@ class ServerMonitor:
                         
                         subscription["history"].append(history_entry)
                     
-                    # 发送无货通知（每个机房单独发送）
-                    for notif in unavailable_notifications:
+                    # ✅ 发送无货通知（聚合发送，所有机房汇总到一个通知）
+                    if unavailable_notifications:
                         config_desc = f" [{config_info['display']}]" if config_info else ""
-                        self.add_log("INFO", f"准备发送提醒: {plan_code}@{notif['dc']}{config_desc} - {notif['change_type']}", "monitor")
+                        self.add_log("INFO", f"准备发送聚合下架提醒: {plan_code}{config_desc} - {len(unavailable_notifications)}个机房", "monitor")
                         server_name = subscription.get("serverName")
                         
-                        # 计算从有货到无货的持续时长（仅在确实是从有货变无货时计算）
-                        duration_text = None
-                        # 只有当前状态是无货，且旧状态不是无货或None时，才是"从有货变无货"
-                        is_became_unavailable = (notif["change_type"] == "unavailable" and 
-                                                  notif.get("old_status") not in ["unavailable", None])
-                        if is_became_unavailable:
-                            try:
-                                last_available_ts = None
-                                same_config_display = config_info.get("display") if config_info else None
-                                history_list = subscription.get("history", [])
-                                self.add_log("INFO", f"[历时计算] {plan_code}@{notif['dc']} 从有货变无货，old_status={notif.get('old_status')}, 历史记录数: {len(history_list)}, 配置: {same_config_display}", "monitor")
-                                # 如果历史记录为空，尝试从同一轮检查的有货通知中获取时间戳
-                                # 注意：有货通知的历史记录已经在上面添加到 subscription["history"] 中
-                                # 从后向前查找最近一次相同机房（且相同配置显示文本时更精确）的 available 记录
-                                for entry in reversed(history_list):
-                                    if entry.get("datacenter") != notif["dc"]:
-                                        continue
-                                    if entry.get("changeType") != "available":
-                                        continue
-                                    if same_config_display:
-                                        cfg = entry.get("config", {})
-                                        if cfg and cfg.get("display") != same_config_display:
+                        # 先计算所有下架机房的持续时长
+                        unavailable_dcs = []
+                        for notif in unavailable_notifications:
+                            # 计算从有货到无货的持续时长（仅在确实是从有货变无货时计算）
+                            duration_text = None
+                            # 只有当前状态是无货，且旧状态不是无货或None时，才是"从有货变无货"
+                            is_became_unavailable = (notif["change_type"] == "unavailable" and 
+                                                      notif.get("old_status") not in ["unavailable", None])
+                            if is_became_unavailable:
+                                try:
+                                    last_available_ts = None
+                                    same_config_display = config_info.get("display") if config_info else None
+                                    history_list = subscription.get("history", [])
+                                    self.add_log("INFO", f"[历时计算] {plan_code}@{notif['dc']} 从有货变无货，old_status={notif.get('old_status')}, 历史记录数: {len(history_list)}, 配置: {same_config_display}", "monitor")
+                                    # 如果历史记录为空，尝试从同一轮检查的有货通知中获取时间戳
+                                    # 注意：有货通知的历史记录已经在上面添加到 subscription["history"] 中
+                                    # 从后向前查找最近一次相同机房（且相同配置显示文本时更精确）的 available 记录
+                                    for entry in reversed(history_list):
+                                        if entry.get("datacenter") != notif["dc"]:
                                             continue
-                                    last_available_ts = entry.get("timestamp")
+                                        if entry.get("changeType") != "available":
+                                            continue
+                                        if same_config_display:
+                                            cfg = entry.get("config", {})
+                                            if cfg and cfg.get("display") != same_config_display:
+                                                continue
+                                        last_available_ts = entry.get("timestamp")
+                                        if last_available_ts:
+                                            self.add_log("INFO", f"[历时计算] 找到有货记录: {plan_code}@{notif['dc']}, 时间: {last_available_ts}", "monitor")
+                                            break
                                     if last_available_ts:
-                                        self.add_log("INFO", f"[历时计算] 找到有货记录: {plan_code}@{notif['dc']}, 时间: {last_available_ts}", "monitor")
-                                        break
-                                if last_available_ts:
-                                    try:
-                                        # 解析ISO时间，按北京时间计算时长（兼容无时区与带时区）
-                                        from datetime import datetime as _dt
                                         try:
-                                            # 优先解析为带时区
-                                            start_dt = _dt.fromisoformat(last_available_ts.replace("Z", "+00:00"))
-                                        except Exception:
-                                            start_dt = _dt.fromisoformat(last_available_ts)
-                                        # 若解析为naive时间，视为北京时间
-                                        if start_dt.tzinfo is None:
+                                            # 解析ISO时间，按北京时间计算时长（兼容无时区与带时区）
+                                            from datetime import datetime as _dt
                                             try:
-                                                from zoneinfo import ZoneInfo
-                                                start_dt = start_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                                                # 优先解析为带时区
+                                                start_dt = _dt.fromisoformat(last_available_ts.replace("Z", "+00:00"))
                                             except Exception:
-                                                # 退化：将其视为UTC+8
-                                                start_dt = start_dt
-                                        delta = self._now_beijing() - start_dt
-                                        total_sec = int(delta.total_seconds())
-                                        if total_sec < 0:
-                                            total_sec = 0
-                                        days = total_sec // 86400
-                                        rem = total_sec % 86400
-                                        hours = rem // 3600
-                                        minutes = (rem % 3600) // 60
-                                        seconds = rem % 60
-                                        if days > 0:
-                                            duration_text = f"历时 {days}天{hours}小时{minutes}分{seconds}秒"
-                                        elif hours > 0:
-                                            duration_text = f"历时 {hours}小时{minutes}分{seconds}秒"
-                                        elif minutes > 0:
-                                            duration_text = f"历时 {minutes}分{seconds}秒"
-                                        else:
-                                            duration_text = f"历时 {seconds}秒"
-                                        self.add_log("INFO", f"[历时计算] 计算成功: {plan_code}@{notif['dc']}, {duration_text}", "monitor")
-                                    except Exception as e:
-                                        self.add_log("WARNING", f"[历时计算] 计算异常: {plan_code}@{notif['dc']}, 错误: {str(e)}", "monitor")
-                                        duration_text = None
-                                else:
-                                    self.add_log("INFO", f"[历时计算] 未找到有货记录: {plan_code}@{notif['dc']}, 无法计算历时", "monitor")
-                            except Exception as e:
-                                self.add_log("WARNING", f"[历时计算] 查找异常: {plan_code}@{notif['dc']}, 错误: {str(e)}", "monitor")
-                                duration_text = None
-                        else:
-                            # 首次检查或无货通知，不计算历时
-                            pass
+                                                start_dt = _dt.fromisoformat(last_available_ts)
+                                            # 若解析为naive时间，视为北京时间
+                                            if start_dt.tzinfo is None:
+                                                try:
+                                                    from zoneinfo import ZoneInfo
+                                                    start_dt = start_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                                                except Exception:
+                                                    # 退化：将其视为UTC+8
+                                                    start_dt = start_dt
+                                            delta = self._now_beijing() - start_dt
+                                            total_sec = int(delta.total_seconds())
+                                            if total_sec < 0:
+                                                total_sec = 0
+                                            days = total_sec // 86400
+                                            rem = total_sec % 86400
+                                            hours = rem // 3600
+                                            minutes = (rem % 3600) // 60
+                                            seconds = rem % 60
+                                            if days > 0:
+                                                duration_text = f"历时 {days}天{hours}小时{minutes}分{seconds}秒"
+                                            elif hours > 0:
+                                                duration_text = f"历时 {hours}小时{minutes}分{seconds}秒"
+                                            elif minutes > 0:
+                                                duration_text = f"历时 {minutes}分{seconds}秒"
+                                            else:
+                                                duration_text = f"历时 {seconds}秒"
+                                            self.add_log("INFO", f"[历时计算] 计算成功: {plan_code}@{notif['dc']}, {duration_text}", "monitor")
+                                        except Exception as e:
+                                            self.add_log("WARNING", f"[历时计算] 计算异常: {plan_code}@{notif['dc']}, 错误: {str(e)}", "monitor")
+                                            duration_text = None
+                                    else:
+                                        self.add_log("INFO", f"[历时计算] 未找到有货记录: {plan_code}@{notif['dc']}, 无法计算历时", "monitor")
+                                except Exception as e:
+                                    self.add_log("WARNING", f"[历时计算] 查找异常: {plan_code}@{notif['dc']}, 错误: {str(e)}", "monitor")
+                                    duration_text = None
+                            
+                            # 添加到下架机房列表
+                            dc_info = {"dc": notif["dc"], "status": notif["status"]}
+                            if duration_text:
+                                dc_info["duration_text"] = duration_text
+                            unavailable_dcs.append(dc_info)
                         
-                        self.send_availability_alert(plan_code, notif["dc"], notif["status"], notif["change_type"], 
-                                                    config_info, server_name, duration_text=duration_text)
+                        # 从第一个通知项中获取 config_trace_id（所有通知项共享同一个配置）
+                        config_trace_id_for_notif = unavailable_notifications[0].get("config_trace_id") if unavailable_notifications else None
+                        # 聚合发送下架通知
+                        self.send_unavailable_alert_grouped(
+                            plan_code, unavailable_dcs, config_info, server_name,
+                            trace_id=trace_id,
+                            config_trace_id=config_trace_id_for_notif
+                        )
                         
                         # 添加到历史记录
                         if "history" not in subscription:
                             subscription["history"] = []
                         
-                        history_entry = {
-                            "timestamp": self._now_beijing().isoformat(),
-                            "datacenter": notif["dc"],
-                            "status": notif["status"],
-                            "changeType": notif["change_type"],
-                            "oldStatus": notif["old_status"]
-                        }
-                        
-                        if config_info:
-                            history_entry["config"] = config_info
-                        
-                        subscription["history"].append(history_entry)
+                        for notif in unavailable_notifications:
+                            history_entry = {
+                                "timestamp": self._now_beijing().isoformat(),
+                                "datacenter": notif["dc"],
+                                "status": notif["status"],
+                                "changeType": notif["change_type"],
+                                "oldStatus": notif["old_status"]
+                            }
+                            
+                            if config_info:
+                                history_entry["config"] = config_info
+                            
+                            subscription["history"].append(history_entry)
                     
                     # ✅ 使用统一方法限制历史记录数量（在循环外统一限制，避免重复检查）
                     self._limit_history_size(subscription)
@@ -720,7 +829,7 @@ class ServerMonitor:
             self.add_log("ERROR", f"检查 {plan_code} 可用性时出错: {str(e)}", "monitor")
             self.add_log("ERROR", f"错误详情: {traceback.format_exc()}", "monitor")
     
-    def _check_and_notify_change(self, subscription, plan_code, dc, status, old_status, config_info=None, status_key=None):
+    def _check_and_notify_change(self, subscription, plan_code, dc, status, old_status, config_info=None, status_key=None, trace_id=None):
         """
         检查状态变化并发送通知
         
@@ -837,7 +946,17 @@ class ServerMonitor:
                     self.add_log("DEBUG", f"查找有货记录异常: {str(e)}", "monitor")
                     duration_text = None
 
-            self.send_availability_alert(plan_code, dc, status, change_type, config_info, server_name, duration_text=duration_text)
+            self.send_availability_alert(
+                plan_code,
+                dc,
+                status,
+                change_type,
+                config_info,
+                server_name,
+                duration_text=duration_text,
+                trace_id=trace_id,
+                detected_time=None  # 旧版兼容代码，不记录检测时间
+            )
             
             # 添加到历史记录
             if "history" not in subscription:
@@ -860,7 +979,7 @@ class ServerMonitor:
             # ✅ 使用统一方法限制历史记录数量，保留最近100条
             self._limit_history_size(subscription)
     
-    def send_availability_alert_grouped(self, plan_code, available_dcs, config_info=None, server_name=None):
+    def send_availability_alert_grouped(self, plan_code, available_dcs, config_info=None, server_name=None, price_error_message=None, trace_id=None, config_trace_id=None):
         """
         发送汇总的可用性提醒（一个通知包含多个有货的机房，带内联键盘按钮）
         
@@ -869,6 +988,8 @@ class ServerMonitor:
             available_dcs: 有货的数据中心列表 [{"dc": "gra", "status": "available"}, ...]
             config_info: 配置信息 {"memory": "xxx", "storage": "xxx", "display": "xxx", "options": [...]}
             server_name: 服务器友好名称
+            trace_id: 订阅级别的主 UUID
+            config_trace_id: 配置级别的子 UUID
         """
         try:
             import json
@@ -895,6 +1016,8 @@ class ServerMonitor:
             
             if price_text:
                 message += f"\n💰 价格: {price_text}\n"
+            elif price_error_message:
+                message += f"\n⚠️ 价格提示：{price_error_message}\n"
             
             message += f"\n✅ 有货的机房 ({len(available_dcs)}个):\n"
             for dc_info in available_dcs:
@@ -922,11 +1045,57 @@ class ServerMonitor:
                 message += f"  • {dc_display} ({dc.upper()})"
                 # ✅ 如果有补货历时时间，添加到机房信息中
                 if "duration_text" in dc_info and dc_info["duration_text"]:
-                    duration_display = dc_info["duration_text"].replace("历时 ", "⏱️ ")
-                    message += f" - {duration_display}"
+                    duration_value = dc_info["duration_text"].replace("历时 ", "")
+                    message += f" - ⏱️ 上次无货→本次有货: {duration_value}"
                 message += "\n"
             
-            message += f"\n⏰ 时间: {self._now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
+            # ✅ 计算检测时间和推送延迟
+            push_time = self._now_beijing()
+            detected_times = []
+            for dc_info in available_dcs:
+                if "detected_time" in dc_info:
+                    try:
+                        from datetime import datetime as _dt
+                        detected_dt = _dt.fromisoformat(dc_info["detected_time"].replace("Z", "+00:00"))
+                        if detected_dt.tzinfo is None:
+                            try:
+                                from zoneinfo import ZoneInfo
+                                detected_dt = detected_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                            except Exception:
+                                pass
+                        detected_times.append(detected_dt)
+                    except Exception:
+                        pass
+            
+            if trace_id or config_trace_id:
+                if trace_id and config_trace_id:
+                    # 两个 UUID 时，使用换行显示，更清晰
+                    message += f"\n🆔 Trace ID:\n  订阅: {trace_id}\n  配置: {config_trace_id}"
+                elif trace_id:
+                    message += f"\n🆔 Trace ID: {trace_id}"
+                elif config_trace_id:
+                    message += f"\n🆔 Trace ID: {config_trace_id}"
+            
+            # ✅ 显示检测时间、推送时间和延迟
+            if detected_times:
+                earliest_detected = min(detected_times)
+                delay = push_time - earliest_detected
+                delay_seconds = int(delay.total_seconds())
+                delay_minutes = delay_seconds // 60
+                delay_secs = delay_seconds % 60
+                
+                message += f"\n⏰ 检测时间: {earliest_detected.strftime('%Y-%m-%d %H:%M:%S')}"
+                message += f"\n📤 推送时间: {push_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                if delay_seconds > 0:
+                    if delay_minutes > 0:
+                        message += f"\n⏱️ 推送延迟: {delay_minutes}分{delay_secs}秒"
+                    else:
+                        message += f"\n⏱️ 推送延迟: {delay_secs}秒"
+                else:
+                    message += f"\n⏱️ 推送延迟: <1秒"
+            else:
+                message += f"\n⏰ 推送时间: {push_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            
             message += f"\n\n💡 点击下方按钮可直接下单对应机房！"
             
             # 构建内联键盘按钮（每个机房一个按钮，最多每行2个按钮）
@@ -1025,7 +1194,89 @@ class ServerMonitor:
             import traceback
             self.add_log("ERROR", f"错误详情: {traceback.format_exc()}", "monitor")
     
-    def send_availability_alert(self, plan_code, datacenter, status, change_type, config_info=None, server_name=None, duration_text=None, price_check_error=None):
+    def send_unavailable_alert_grouped(self, plan_code, unavailable_dcs, config_info=None, server_name=None, trace_id=None, config_trace_id=None):
+        """
+        发送聚合的下架通知（一个通知包含多个无货的机房）
+        
+        Args:
+            plan_code: 服务器型号
+            unavailable_dcs: 无货的数据中心列表 [{"dc": "gra", "duration_text": "历时 xxx"}, ...]
+            config_info: 配置信息 {"memory": "xxx", "storage": "xxx", "display": "xxx"}
+            server_name: 服务器友好名称
+            trace_id: 订阅级别的主 UUID
+            config_trace_id: 配置级别的子 UUID
+        """
+        try:
+            message = f"📦 服务器下架通知\n\n"
+            
+            if server_name:
+                message += f"服务器: {server_name}\n"
+            
+            message += f"型号: {plan_code}\n"
+            
+            if config_info:
+                message += (
+                    f"配置: {config_info['display']}\n"
+                    f"├─ 内存: {config_info['memory']}\n"
+                    f"└─ 存储: {config_info['storage']}\n"
+                )
+            
+            message += f"\n已下架机房 ({len(unavailable_dcs)} 个):\n"
+            
+            # 数据中心显示名称映射
+            dc_display_map = {
+                "gra": "🇫🇷 法国·格拉沃利讷",
+                "rbx": "🇫🇷 法国·鲁贝",
+                "sbg": "🇫🇷 法国·斯特拉斯堡",
+                "bhs": "🇨🇦 加拿大·博瓦桑",
+                "syd": "🇦🇺 澳大利亚·悉尼",
+                "sgp": "🇸🇬 新加坡",
+                "ynm": "🇮🇳 印度·孟买",
+                "waw": "🇵🇱 波兰·华沙",
+                "fra": "🇩🇪 德国·法兰克福",
+                "lon": "🇬🇧 英国·伦敦",
+                "par": "🇫🇷 法国·巴黎",
+                "eri": "🇮🇹 意大利·埃里切",
+                "lim": "🇵🇱 波兰·利马诺瓦",
+                "vin": "🇺🇸 美国·弗吉尼亚",
+                "hil": "🇺🇸 美国·俄勒冈"
+            }
+            
+            for dc_info in unavailable_dcs:
+                dc = dc_info.get("dc", "")
+                dc_display = dc_display_map.get(dc.lower(), dc.upper())
+                message += f"  • {dc_display} ({dc.upper()})"
+                # ✅ 如果有上架持续时长，添加到机房信息中
+                if "duration_text" in dc_info and dc_info["duration_text"]:
+                    duration_value = dc_info["duration_text"].replace("历时 ", "")
+                    message += f" - ⏱️ 本次上架持续: {duration_value}"
+                message += "\n"
+            
+            if trace_id or config_trace_id:
+                if trace_id and config_trace_id:
+                    # 两个 UUID 时，使用换行显示，更清晰
+                    message += f"\n🆔 Trace ID:\n  订阅: {trace_id}\n  配置: {config_trace_id}"
+                elif trace_id:
+                    message += f"\n🆔 Trace ID: {trace_id}"
+                elif config_trace_id:
+                    message += f"\n🆔 Trace ID: {config_trace_id}"
+            message += f"\n⏰ 时间: {self._now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
+            
+            config_desc = f" [{config_info['display']}]" if config_info else ""
+            self.add_log("INFO", f"正在发送聚合下架Telegram通知: {plan_code}{config_desc} - {len(unavailable_dcs)}个机房", "monitor")
+            result = self.send_notification(message)
+            
+            if result:
+                self.add_log("INFO", f"✅ Telegram聚合下架通知发送成功: {plan_code}{config_desc}", "monitor")
+            else:
+                self.add_log("WARNING", f"⚠️ Telegram聚合下架通知发送失败: {plan_code}{config_desc}", "monitor")
+                
+        except Exception as e:
+            self.add_log("ERROR", f"发送聚合下架提醒时发生异常: {str(e)}", "monitor")
+            import traceback
+            self.add_log("ERROR", f"错误详情: {traceback.format_exc()}", "monitor")
+    
+    def send_availability_alert(self, plan_code, datacenter, status, change_type, config_info=None, server_name=None, duration_text=None, price_check_error=None, trace_id=None, config_trace_id=None, detected_time=None):
         """
         发送可用性变化提醒
         
@@ -1036,6 +1287,9 @@ class ServerMonitor:
             change_type: 变化类型
             config_info: 配置信息 {"memory": "xxx", "storage": "xxx", "display": "xxx"}
             server_name: 服务器友好名称（如"KS-2 | Intel Xeon-D 1540"）
+            trace_id: 订阅级别的主 UUID
+            config_trace_id: 配置级别的子 UUID
+            detected_time: 检测到有货的时间（ISO格式字符串）
         """
         try:
             if change_type == "available":
@@ -1059,6 +1313,7 @@ class ServerMonitor:
                 
                 # 获取价格信息（优先使用缓存的价格）
                 price_text = None
+                price_fetch_error = None
                 
                 # 如果config_info中包含已查询的价格，直接使用
                 if config_info and "cached_price" in config_info:
@@ -1074,12 +1329,18 @@ class ServerMonitor:
                         price_queue = queue.Queue()
                         
                         def fetch_price():
+                            local_trace_id = trace_id or self._get_trace_id()
+                            if local_trace_id:
+                                self._set_trace_id(local_trace_id)
                             try:
                                 price_result = self._get_price_info(plan_code, datacenter, config_info)
                                 price_queue.put(price_result)
                             except Exception as e:
                                 self.add_log("WARNING", f"价格获取线程异常: {str(e)}", "monitor")
                                 price_queue.put(None)
+                            finally:
+                                if local_trace_id:
+                                    self._clear_trace_id()
                         
                         # 启动价格获取线程
                         price_thread = threading.Thread(
@@ -1094,6 +1355,7 @@ class ServerMonitor:
                         
                         if price_thread.is_alive():
                             # ✅ 线程超时，记录详细信息（daemon线程会在主程序退出时自动结束）
+                            price_fetch_error = f"价格接口超时（等待{elapsed_time:.1f}秒）"
                             self.add_log("WARNING", 
                                 f"价格获取超时（已等待{elapsed_time:.1f}秒，线程ID: {price_thread.ident}），"
                                 f"发送不带价格的通知。daemon线程将在后台继续运行直到完成。", 
@@ -1104,6 +1366,7 @@ class ServerMonitor:
                             try:
                                 price_text = price_queue.get_nowait()
                             except queue.Empty:
+                                price_fetch_error = f"价格接口结束但无返回数据（耗时{elapsed_time:.1f}秒）"
                                 price_text = None
                                 self.add_log("WARNING", 
                                     f"价格获取线程已完成但队列为空（耗时{elapsed_time:.1f}秒）", 
@@ -1111,10 +1374,13 @@ class ServerMonitor:
                         
                         if not price_text:
                             # 如果价格获取失败，记录警告但继续发送通知
+                            if not price_fetch_error:
+                                price_fetch_error = f"价格接口未返回结果（耗时{elapsed_time:.1f}秒）"
                             self.add_log("WARNING", 
                                 f"价格获取失败或超时（耗时{elapsed_time:.1f}秒），通知中不包含价格信息", 
                                 "monitor")
                     except Exception as e:
+                        price_fetch_error = f"价格接口异常: {str(e)}"
                         self.add_log("WARNING", f"价格获取过程异常: {str(e)}，发送不带价格的通知", "monitor")
                         import traceback
                         self.add_log("WARNING", f"价格获取异常详情: {traceback.format_exc()}", "monitor")
@@ -1122,14 +1388,55 @@ class ServerMonitor:
                 # 如果有价格信息，添加到消息中
                 if price_text:
                     message += f"\n💰 价格: {price_text}\n"
+                elif price_fetch_error:
+                    message += f"\n⚠️ 价格提示：{price_fetch_error}\n"
                 
                 message += f"状态: {status}\n"
-                message += f"时间: {self._now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
                 
                 # ✅ 如果有补货历时时间，添加到消息中
                 if duration_text:
-                    duration_display = duration_text.replace("历时 ", "⏱️ 历时: ")
-                    message += f"\n{duration_display}"
+                    duration_value = duration_text.replace("历时 ", "")
+                    message += f"⏱️ 上次无货→本次有货: {duration_value}\n"
+                
+                # ✅ 显示检测时间、推送时间和延迟
+                push_time = self._now_beijing()
+                if detected_time:
+                    try:
+                        from datetime import datetime as _dt
+                        detected_dt = _dt.fromisoformat(detected_time.replace("Z", "+00:00"))
+                        if detected_dt.tzinfo is None:
+                            try:
+                                from zoneinfo import ZoneInfo
+                                detected_dt = detected_dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+                            except Exception:
+                                pass
+                        delay = push_time - detected_dt
+                        delay_seconds = int(delay.total_seconds())
+                        delay_minutes = delay_seconds // 60
+                        delay_secs = delay_seconds % 60
+                        
+                        message += f"⏰ 检测时间: {detected_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        message += f"📤 推送时间: {push_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                        if delay_seconds > 0:
+                            if delay_minutes > 0:
+                                message += f"⏱️ 推送延迟: {delay_minutes}分{delay_secs}秒\n"
+                            else:
+                                message += f"⏱️ 推送延迟: {delay_secs}秒\n"
+                        else:
+                            message += f"⏱️ 推送延迟: <1秒\n"
+                    except Exception:
+                        message += f"⏰ 推送时间: {push_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                else:
+                    message += f"⏰ 推送时间: {push_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                
+                if trace_id or config_trace_id:
+                    if trace_id and config_trace_id:
+                        # 两个 UUID 时，使用换行显示，更清晰
+                        message += f"\n🆔 Trace ID:\n  订阅: {trace_id}\n  配置: {config_trace_id}"
+                    elif trace_id:
+                        message += f"\n🆔 Trace ID: {trace_id}"
+                    elif config_trace_id:
+                        message += f"\n🆔 Trace ID: {config_trace_id}"
                 
                 message += f"\n\n💡 快去抢购吧！"
             elif change_type == "price_check_failed":
@@ -1159,7 +1466,16 @@ class ServerMonitor:
                         message += f"\n💰 价格: {price_text}\n"
                 
                 message += f"\n状态: 可用性显示有货\n"
-                message += f"时间: {self._now_beijing().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                message += f"时间: {self._now_beijing().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                if trace_id or config_trace_id:
+                    if trace_id and config_trace_id:
+                        # 两个 UUID 时，使用换行显示，更清晰
+                        message += f"🆔 Trace ID:\n  订阅: {trace_id}\n  配置: {config_trace_id}\n"
+                    elif trace_id:
+                        message += f"🆔 Trace ID: {trace_id}\n"
+                    elif config_trace_id:
+                        message += f"🆔 Trace ID: {config_trace_id}\n"
+                message += "\n"
                 message += f"⚠️ 特别说明：\n"
                 if price_check_error:
                     message += f"（价格校验未通过: {price_check_error}，已跳过自动下单）"
@@ -1186,11 +1502,18 @@ class ServerMonitor:
                 message += f"\n数据中心: {datacenter}\n"
                 message += f"状态: 已无货\n"
                 message += f"⏰ 时间: {self._now_beijing().strftime('%Y-%m-%d %H:%M:%S')}"
+                if trace_id or config_trace_id:
+                    if trace_id and config_trace_id:
+                        # 两个 UUID 时，使用换行显示，更清晰
+                        message += f"\n🆔 Trace ID:\n  订阅: {trace_id}\n  配置: {config_trace_id}"
+                    elif trace_id:
+                        message += f"\n🆔 Trace ID: {trace_id}"
+                    elif config_trace_id:
+                        message += f"\n🆔 Trace ID: {config_trace_id}"
                 # 若可用，追加"从有货到无货历时多久"，格式与时间保持一致
                 if duration_text:
-                    # duration_text 格式为 "历时 xxx"，改为 "⏱️ 历时: xxx" 以保持样式一致
-                    duration_display = duration_text.replace("历时 ", "⏱️ 历时: ")
-                    message += f"\n{duration_display}"
+                    duration_value = duration_text.replace("历时 ", "")
+                    message += f"\n⏱️ 本次上架持续: {duration_value}"
             
             config_desc = f" [{config_info['display']}]" if config_info else ""
             self.add_log("INFO", f"正在发送Telegram通知: {plan_code}@{datacenter}{config_desc}", "monitor")
@@ -1441,6 +1764,17 @@ class ServerMonitor:
         if expired_uuids or expired_options_keys:
             self.add_log("DEBUG", f"清理过期缓存: UUID={len(expired_uuids)}个, Options={len(expired_options_keys)}个", "monitor")
     
+    def _run_subscription_check(self, subscription, trace_id):
+        """执行单个订阅的检查任务（带Trace ID上下文）"""
+        self._set_trace_id(trace_id)
+        plan_code = subscription.get("planCode")
+        try:
+            self.add_log("INFO", f"开始处理订阅: {plan_code}", "monitor")
+            self.check_availability_change(subscription, trace_id=trace_id)
+            self.add_log("INFO", f"完成处理订阅: {plan_code}", "monitor")
+        finally:
+            self._clear_trace_id()
+    
     def monitor_loop(self):
         """监控主循环"""
         self.add_log("INFO", "监控循环已启动", "monitor")
@@ -1452,19 +1786,33 @@ class ServerMonitor:
                 
                 # 检查订阅的服务器
                 if self.subscriptions:
-                    self.add_log("INFO", f"开始检查 {len(self.subscriptions)} 个订阅...", "monitor")
+                    subscription_count = len(self.subscriptions)
+                    self.add_log("INFO", f"开始检查 {subscription_count} 个订阅...", "monitor")
                     
                     # ✅ 创建副本避免在遍历时修改列表导致的竞态条件
                     subscriptions_copy = list(self.subscriptions)
-                    for subscription in subscriptions_copy:
-                        if not self.running:  # 检查是否被停止
-                            break
-                        # 再次检查订阅是否仍在列表中（可能在遍历期间被删除）
-                        if subscription not in self.subscriptions:
-                            self.add_log("DEBUG", f"订阅 {subscription.get('planCode')} 在检查期间被删除，跳过", "monitor")
-                            continue
-                        self.check_availability_change(subscription)
-                        time.sleep(1)  # 避免请求过快
+                    max_workers = min(self.max_workers, subscription_count) or 1
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        future_map = {}
+                        for subscription in subscriptions_copy:
+                            if not self.running:
+                                break
+                            if subscription not in self.subscriptions:
+                                self.add_log("DEBUG", f"订阅 {subscription.get('planCode')} 在检查期间被删除，跳过", "monitor")
+                                continue
+                            trace_id = str(uuid.uuid4())
+                            future = executor.submit(self._run_subscription_check, subscription, trace_id)
+                            future_map[future] = (subscription.get("planCode"), trace_id)
+                        
+                        for future, (plan_code, trace_id) in future_map.items():
+                            try:
+                                future.result()
+                            except Exception as e:
+                                self.add_log(
+                                    "ERROR",
+                                    f"[trace:{trace_id}] 并发检查订阅 {plan_code} 时异常: {str(e)}",
+                                    "monitor"
+                                )
                 else:
                     self.add_log("INFO", "当前无订阅，跳过检查", "monitor")
                 

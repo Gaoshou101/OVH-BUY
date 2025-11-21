@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import { createPortal } from "react-dom";
+import { Link } from "react-router-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { useAPI } from "@/context/APIContext";
 import { api } from "@/utils/apiClient";
@@ -616,6 +617,24 @@ const QueuePage = () => {
 
       {/* Queue List */}
       <div>
+        {/* 温馨提示 */}
+        <div className="mb-4 p-3 bg-blue-500/10 border border-blue-500/30 rounded-lg">
+          <p className="text-sm text-blue-300 flex items-start gap-2">
+            <span className="text-base">💡</span>
+            <span>
+              <strong className="text-blue-200">温馨提示：</strong>
+              已抢购成功的订单不会出现在抢购队列中，成功订单请前往
+              <Link 
+                to="/history" 
+                className="text-cyber-accent hover:text-cyber-primary underline mx-1"
+              >
+                抢购历史
+              </Link>
+              查看订单详情。
+            </span>
+          </p>
+        </div>
+        
         <div className="space-y-3">
             {queueItems.map(item => (
               <div 

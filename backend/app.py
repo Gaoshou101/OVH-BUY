@@ -963,6 +963,22 @@ def purchase_server(queue_item):
         order_id_val = checkout_result.get("orderId", "")
         order_url_val = checkout_result.get("url", "")
         
+        # ✅ 查询订单详情获取过期时间
+        expiration_time_iso = None
+        if order_id_val:
+            try:
+                order_info = client.get(f'/me/order/{order_id_val}')
+                # OVH API 可能返回 retractionDate (订单撤销/过期日期) 或 expirationDate
+                expiration_time_iso = order_info.get('retractionDate') or order_info.get('expirationDate')
+                if expiration_time_iso:
+                    add_log("INFO", f"获取订单 {order_id_val} 过期时间: {expiration_time_iso}", "purchase")
+                else:
+                    # 调试：输出订单信息的所有字段，帮助了解API返回结构
+                    add_log("DEBUG", f"订单 {order_id_val} 未返回过期时间字段，订单信息字段: {list(order_info.keys())}", "purchase")
+                    add_log("DEBUG", f"订单 {order_id_val} 完整信息: {order_info}", "purchase")
+            except Exception as e:
+                add_log("WARNING", f"查询订单 {order_id_val} 详情失败，无法获取过期时间: {str(e)}", "purchase")
+        
         # Update or create purchase history entry for SUCCESS
         existing_history_entry = next((h for h in purchase_history if h.get("taskId") == queue_item["id"]), None)
         current_time_iso = datetime.now().isoformat()
@@ -975,6 +991,8 @@ def purchase_server(queue_item):
             existing_history_entry["purchaseTime"] = current_time_iso
             existing_history_entry["attemptCount"] = queue_item["retryCount"]
             existing_history_entry["options"] = queue_item.get("options", [])
+            if expiration_time_iso:
+                existing_history_entry["expirationTime"] = expiration_time_iso
             if price_info:
                 existing_history_entry["price"] = price_info
             add_log("INFO", f"更新抢购历史(成功) 任务ID: {queue_item['id']}", "purchase")
@@ -992,6 +1010,8 @@ def purchase_server(queue_item):
                 "purchaseTime": current_time_iso,
                 "attemptCount": queue_item["retryCount"]
             }
+            if expiration_time_iso:
+                history_entry["expirationTime"] = expiration_time_iso
             if price_info:
                 history_entry["price"] = price_info
             purchase_history.append(history_entry)
